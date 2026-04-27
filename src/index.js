@@ -2,6 +2,7 @@
 //  CLASIFICADOR METRORED-BUPA  |  Cloudflare Worker
 //  OCR con Azure Document Intelligence + GPT-4o + SharePoint
 // ============================================================
+import { PDFDocument } from 'pdf-lib';
 
 function buildHTML() {
   return '<!DOCTYPE html>' +
@@ -152,21 +153,38 @@ async function handleProcess(request, env) {
   const despachoPath = spFolder + '/DESPACHO-' + despachoNum;
   await createSharePointFolder(spToken, siteInfo.driveId, despachoPath);
 
-  // 5. Crear subcarpeta por caso y subir PDF completo (por ahora uno por caso)
+  // 5. Cargar PDF con pdf-lib para separar paginas
+  const pdfDoc = await PDFDocument.load(pdfBytes);
+  const totalPages = pdfDoc.getPageCount();
+
+  // 6. Crear subcarpeta por caso y subir paginas individuales
   const results = [];
   for (const caso of cases) {
     const patientClean = sanitize(caso.patient_name || 'PACIENTE_DESCONOCIDO');
     const policyNum    = (caso.policy_number || 'SIN_POLIZA').toString().trim();
     const folderName   = policyNum + ' - ' + patientClean;
     const casePath     = despachoPath + '/' + folderName;
+    const pages        = caso.pages || [];
+    const docTypes     = caso.document_types || [];
 
     await createSharePointFolder(spToken, siteInfo.driveId, casePath);
 
-    // Subir el PDF completo a la carpeta del caso
-    const fileName = policyNum + '_' + patientClean + '.pdf';
-    await uploadSharePointFile(spToken, siteInfo.driveId, casePath + '/' + fileName, pdfBytes);
+    // Subir cada pagina como PDF individual
+    for (let i = 0; i < pages.length; i++) {
+      const pageIndex = pages[i] - 1;
+      if (pageIndex < 0 || pageIndex >= totalPages) continue;
 
-    results.push({ folder: folderName, pages: caso.pages || [], status: 'OK' });
+      const singleDoc = await PDFDocument.create();
+      const [copied]  = await singleDoc.copyPages(pdfDoc, [pageIndex]);
+      singleDoc.addPage(copied);
+      const singleBytes = await singleDoc.save();
+
+      const docType  = docTypes[i] || ('pagina_' + pages[i]);
+      const fileName = (i + 1) + '_' + docType + '.pdf';
+      await uploadSharePointFile(spToken, siteInfo.driveId, casePath + '/' + fileName, singleBytes);
+    }
+
+    results.push({ folder: folderName, pages: pages, status: 'OK' });
   }
 
   return { success: true, despacho: despachoNum, cases_processed: results.length, cases: results };
