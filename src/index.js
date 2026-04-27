@@ -153,9 +153,7 @@ async function handleProcess(request, env) {
     const patientClean = sanitize(caso.patient_name || 'PACIENTE_DESCONOCIDO');
     const policyNum = (caso.policy_number || 'SIN_POLIZA').toString().trim();
     const folderName = policyNum + ' - ' + patientClean;
-    const caseFolderId = await createDriveFolder(folderName, despachoFolderId, driveToken);
-    const infoText = 'Poliza: ' + policyNum + '\nPaciente: ' + patientClean + '\nPaginas: ' + (caso.pages || []).join(', ');
-    await uploadToDrive('info_caso.txt', new TextEncoder().encode(infoText), caseFolderId, driveToken, 'text/plain');
+    await createDriveFolder(folderName, despachoFolderId, driveToken);
     results.push({ folder: folderName, pages: caso.pages || [], status: 'OK' });
   }
 
