@@ -1,9 +1,8 @@
-// ============================================================
+﻿// ============================================================
 //  CLASIFICADOR METRORED-BUPA  |  Cloudflare Worker
 //  Extrae datos con IA, crea carpetas y sube PDFs a Drive
 // ============================================================
 
-import { PDFDocument } from 'pdf-lib';
 
 // ─────────────────────────── HTML UI ───────────────────────────
 const HTML_PAGE = `<!DOCTYPE html>
@@ -477,3 +476,4 @@ function uint8ToBase64(arr) {
   }
   return btoa(s);
 }
+
