@@ -115,6 +115,26 @@ export default {
     };
     if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
     if (url.pathname === '/') return new Response(buildHTML(), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    // Debug endpoint - returns raw OCR text
+    if (url.pathname === '/api/debug' && request.method === 'POST') {
+      try {
+        const form = await request.formData();
+        const pdfFile = form.get('pdf');
+        const pdfBytes = new Uint8Array(await pdfFile.arrayBuffer());
+        const ocrText = await extractTextWithOCR(pdfBytes, env.DOCAI_ENDPOINT, env.DOCAI_KEY);
+        const lines = ocrText.split('\n');
+        const sample = lines.slice(0, 80).join('\n');
+        return new Response(JSON.stringify({ 
+          total_chars: ocrText.length,
+          total_lines: lines.length,
+          has_pagina_marker: ocrText.includes('PAGINA'),
+          sample: sample
+        }), { headers: { ...cors, 'Content-Type': 'application/json' } });
+      } catch(err) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: cors });
+      }
+    }
+
     if (url.pathname === '/api/process' && request.method === 'POST') {
       try {
         const result = await handleProcess(request, env);
