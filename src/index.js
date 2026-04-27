@@ -245,79 +245,107 @@ function sleep(ms) {
   return new Promise(function(resolve) { setTimeout(resolve, ms); });
 }
 
-// ─── GPT-4o CASE EXTRACTION ──────────────────────────────────
+// ─── CASE EXTRACTION FROM OCR TEXT ───────────────────────────
 async function extractCasesWithGPT(ocrText, apiKey) {
-  // Split OCR text by page markers and process in chunks of 10 pages
-  const pagePattern = /--- PAGINA (\d+) ---/g;
-  const pageMatches = [...ocrText.matchAll(pagePattern)];
-  
-  if (pageMatches.length === 0) {
-    throw new Error('OCR no identifico paginas en el documento');
+  // Split into pages
+  const pages = ocrText.split(/---\s*PAGINA\s+\d+\s*---/).filter(p => p.trim().length > 20);
+  const totalPages = pages.length;
+
+  // Extract patient name from Metrored page
+  function extractPatient(text) {
+    const m = text.match(/Paciente:\s*([A-ZÑÁÉÍÓÚ][A-ZÑÁÉÍÓÚ\s]{5,60}?)(?:\s*Edad:|$|\n)/m);
+    return m ? m[1].trim().replace(/\s+/g, ' ') : null;
   }
 
-  // Build page map: pageNumber -> text content
-  const pageMap = {};
-  for (let i = 0; i < pageMatches.length; i++) {
-    const pageNum = parseInt(pageMatches[i][1]);
-    const start = pageMatches[i].index;
-    const end = i + 1 < pageMatches.length ? pageMatches[i+1].index : ocrText.length;
-    pageMap[pageNum] = ocrText.slice(start, end).trim();
+  // Extract policy number from BUPA page
+  function extractPolicy(text) {
+    const m = text.match(/\((\d{5,7})\)/);
+    return m ? m[1] : null;
   }
 
-  const totalPages = pageMatches.length;
-  const allCases = [];
-  
-  // Process in chunks of 8 pages (4 cases at a time)
-  const chunkSize = 8;
-  let pageOffset = 0;
-  
-  for (let startPage = 1; startPage <= totalPages; startPage += chunkSize) {
-    const endPage = Math.min(startPage + chunkSize - 1, totalPages);
-    
-    // Build chunk text with page numbers
-    let chunkText = '';
-    for (let p = startPage; p <= endPage; p++) {
-      if (pageMap[p]) chunkText += pageMap[p] + '\n\n';
+  // Detect page type
+  function pageType(text) {
+    if (/AUTORIZACION DE COBERTURA|AUTORIZACIÓN DE COBERTURA|Numero de P.liza|Número de Póliza/i.test(text)) return 'bupa';
+    if (/Estado de cuenta|METRORED|Paciente:/i.test(text)) return 'metrored';
+    return 'other';
+  }
+
+  const cases = [];
+  let i = 0;
+
+  while (i < pages.length) {
+    const type = pageType(pages[i]);
+    const pageNum = i + 1;
+
+    if (type === 'metrored') {
+      const patient = extractPatient(pages[i]);
+      if (!patient) { i++; continue; }
+
+      // Check if next page is BUPA for this patient
+      if (i + 1 < pages.length && pageType(pages[i+1]) === 'bupa') {
+        const policy = extractPolicy(pages[i+1]) || 'SIN_POLIZA';
+        cases.push({
+          policy_number: policy,
+          patient_name: patient,
+          pages: [pageNum, pageNum + 1],
+          document_types: ['estado_cuenta_metrored', 'autorizacion_cobertura_bupa']
+        });
+        i += 2;
+      } else {
+        // Metrored without BUPA
+        cases.push({
+          policy_number: 'SIN_POLIZA',
+          patient_name: patient,
+          pages: [pageNum],
+          document_types: ['estado_cuenta_metrored']
+        });
+        i++;
+      }
+    } else if (type === 'bupa') {
+      // Standalone BUPA page
+      const policy = extractPolicy(pages[i]) || 'SIN_POLIZA';
+      const asegurado = pages[i].match(/Asegurado:\s*([A-ZÑÁÉÍÓÚ][A-ZÑÁÉÍÓÚ\s]{5,60}?)(?:\s*Fecha|\n)/m);
+      const patient = asegurado ? asegurado[1].trim().replace(/\s+/g, ' ') : 'PACIENTE_' + pageNum;
+      cases.push({
+        policy_number: policy,
+        patient_name: patient,
+        pages: [pageNum],
+        document_types: ['autorizacion_cobertura_bupa']
+      });
+      i++;
+    } else {
+      i++;
     }
-    
-    const prompt =
-      'Analiza el siguiente texto OCR de paginas ' + startPage + ' a ' + endPage + ' de un PDF medico Metrored/BUPA Ecuador.\n\n' +
-      'Cada caso tiene 2 paginas: 1) Estado de Cuenta METRORED (nombre del paciente en campo "Paciente:") y 2) Autorizacion BUPA (numero de poliza entre parentesis como "(700220)").\n\n' +
-      'IMPORTANTE: Algunos casos tienen solo pagina Metrored sin BUPA — usa "SIN_POLIZA" para esos.\n' +
-      'Algunos documentos son de otras aseguradoras (CLAVESEGUROS, PLUS MEDICAL) — incluyelos con "SIN_POLIZA".\n\n' +
-      'Devuelve UNICAMENTE array JSON sin texto extra ni markdown:\n' +
-      '[{"policy_number":"700220","patient_name":"APELLIDO NOMBRE","pages":[1,2],"document_types":["estado_cuenta_metrored","autorizacion_cobertura_bupa"]}]\n\n' +
-      'Si no hay casos en este bloque, devuelve: []\n\n' +
-      'TEXTO OCR:\n' + chunkText;
-
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-      body: JSON.stringify({ model: 'gpt-4o', max_tokens: 2048, messages: [{ role: 'user', content: prompt }] })
-    });
-
-    if (!response.ok) {
-      const err = await response.text();
-      throw new Error('OpenAI error (' + response.status + '): ' + err);
-    }
-
-    const data    = await response.json();
-    const raw     = (data.choices && data.choices[0] && data.choices[0].message) ? data.choices[0].message.content.trim() : '[]';
-    const cleaned = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
-
-    try {
-      const chunk = JSON.parse(cleaned);
-      if (Array.isArray(chunk)) allCases.push(...chunk);
-    } catch (e) {
-      // Skip unparseable chunks, continue
-    }
   }
 
-  if (allCases.length === 0) {
-    throw new Error('No se pudieron extraer casos de ninguna pagina');
+  // If regex extraction got less than 3 cases, fall back to GPT-4o on full text
+  if (cases.length < 3) {
+    return await extractWithGPTFallback(ocrText, apiKey, totalPages);
   }
 
-  return allCases;
+  return cases;
+}
+
+async function extractWithGPTFallback(ocrText, apiKey, totalPages) {
+  // Send structured summary to GPT-4o
+  const prompt =
+    'El siguiente texto OCR viene de un PDF medico de ' + totalPages + ' paginas de Metrored/BUPA Ecuador.\n' +
+    'Cada caso tiene 2 paginas: pagina Metrored (campo "Paciente:") y pagina BUPA (numero poliza entre parentesis).\n' +
+    'Extrae TODOS los casos. Devuelve SOLO array JSON:\n' +
+    '[{"policy_number":"700220","patient_name":"APELLIDO NOMBRE","pages":[1,2],"document_types":["estado_cuenta_metrored","autorizacion_cobertura_bupa"]}]\n\n' +
+    'TEXTO:\n' + ocrText.substring(0, 20000);
+
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+    body: JSON.stringify({ model: 'gpt-4o', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] })
+  });
+
+  if (!resp.ok) throw new Error('OpenAI fallback error: ' + await resp.text());
+  const data    = await resp.json();
+  const raw     = (data.choices?.[0]?.message?.content || '[]').trim();
+  const cleaned = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+  try { return JSON.parse(cleaned); } catch { return []; }
 }
 
 // ─── SHAREPOINT AUTH ─────────────────────────────────────────
