@@ -1,0 +1,17 @@
+{
+  "name": "metrored-clasificador",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Clasificador automático de escaneados BUPA-Metrored hacia Google Drive",
+  "scripts": {
+    "dev":    "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail":   "wrangler tail"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
+  },
+  "devDependencies": {
+    "wrangler": "^3.101.0"
+  }
+}
