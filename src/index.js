@@ -244,7 +244,7 @@ async function extractTextWithOCR(pdfBytes, endpoint, key) {
       const pages = pollData.analyzeResult && pollData.analyzeResult.pages ? pollData.analyzeResult.pages : [];
       let fullText = '';
       for (const page of pages) {
-        fullText += '\n--- PAGINA ' + page.pageNumber + ' ---\n';
+        fullText += '\n<<<PAG' + page.pageNumber + '>>>' + '\n';
         const lines = page.lines || [];
         for (const line of lines) {
           fullText += line.content + '\n';
@@ -268,7 +268,10 @@ function sleep(ms) {
 // ─── CASE EXTRACTION FROM OCR TEXT ───────────────────────────
 async function extractCasesWithGPT(ocrText, apiKey) {
   // Split into pages
-  const pages = ocrText.split(/---\s*PAGINA\s+\d+\s*---/).filter(p => p.trim().length > 20);
+  // Split by page markers (<<<PAG1>>>, <<<PAG2>>>, etc)
+  const pageMarkerRegex = /<<<PAG\d+>>>/g;
+  const pageTexts = ocrText.split(pageMarkerRegex).filter(p => p.trim().length > 20);
+  const pages = pageTexts;
   const totalPages = pages.length;
 
   // Extract patient name from Metrored page
