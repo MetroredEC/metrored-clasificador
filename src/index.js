@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 //  CLASIFICADOR METRORED-BUPA  |  Cloudflare Worker
 //  Extrae datos con IA, crea carpetas y sube PDFs a Drive
 // ============================================================
@@ -227,7 +227,7 @@ async function handleProcess(request, env) {
   const pdfBase64 = uint8ToBase64(pdfBytes);
 
   // 2. Extract cases with Claude AI
-  const cases = await extractCasesWithClaude(pdfBase64, env.ANTHROPIC_API_KEY);
+  const cases = await extractCasesWithClaude(pdfBase64, env.OPENAI_API_KEY);
   if (!Array.isArray(cases) || cases.length === 0) {
     throw new Error('No se pudieron extraer casos del PDF. Verifica que el archivo sea correcto.');
   }
@@ -477,3 +477,4 @@ function uint8ToBase64(arr) {
   }
   return btoa(s);
 }
+
