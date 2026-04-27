@@ -267,8 +267,7 @@ async function createSharePointFolder(token, driveId, folderPath) {
       headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: part,
-        folder: {},
-        '@microsoft.graph.conflictBehavior': 'ignore'
+        folder: {}
       })
     });
     const d = await res.json();
