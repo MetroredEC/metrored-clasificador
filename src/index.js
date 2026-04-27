@@ -1,6 +1,6 @@
 // ============================================================
 //  CLASIFICADOR METRORED-BUPA  |  Cloudflare Worker
-//  GPT-4o extrae datos, SharePoint organiza carpetas y PDFs
+//  OCR con Azure Document Intelligence + GPT-4o + SharePoint
 // ============================================================
 
 function buildHTML() {
@@ -41,7 +41,7 @@ function buildHTML() {
 '</style></head><body>' +
 '<div class="card">' +
 '<div style="text-align:center;margin-bottom:20px">' +
-'<h1>Clasificador BUPA-Metrored <span class="badge">GPT-4o</span></h1>' +
+'<h1>Clasificador BUPA-Metrored <span class="badge">OCR + GPT-4o</span></h1>' +
 '<p class="sub">Organiza escaneados masivos en SharePoint automaticamente</p>' +
 '</div>' +
 '<div class="sec">' +
@@ -50,10 +50,10 @@ function buildHTML() {
 '<div><label>Numero de Despacho <span class="hint">ej: 2026-04-27</span></label>' +
 '<input type="text" id="despacho" placeholder="2026-04-27"></div>' +
 '<div><label>Carpeta SharePoint <span class="hint">nombre exacto</span></label>' +
-'<input type="text" id="spFolder" placeholder="Despachos Bupa"></div>' +
+'<input type="text" id="spFolder" placeholder="Shared Documents"></div>' +
 '</div></div>' +
 '<div class="sec">' +
-'<div class="sec-t">PDF Masivo</div>' +
+'<div class="sec-t">PDF Masivo Escaneado</div>' +
 '<div class="drop" id="drop">' +
 '<input type="file" id="fi" accept=".pdf" onchange="pickFile(this)">' +
 '<p>Arrastra el PDF aqui o <strong>haz clic para seleccionar</strong></p>' +
@@ -81,14 +81,13 @@ function buildHTML() {
 'btn.disabled=true;' +
 'document.getElementById("prog").style.display="block";' +
 'document.getElementById("res").style.display="none";' +
-'setBar(8,"Leyendo PDF...");' +
+'setBar(5,"Leyendo PDF...");' +
 'var fd=new FormData();' +
 'fd.append("pdf",file);' +
 'fd.append("despacho",despacho);' +
 'fd.append("spFolder",spFolder);' +
-'setBar(20,"Extrayendo datos con IA (30-60 seg)...");' +
+'setBar(15,"Enviando a OCR (puede tardar 1-2 min segun paginas)...");' +
 'fetch("/api/process",{method:"POST",body:fd}).then(function(resp){' +
-'setBar(75,"Creando carpetas y subiendo PDFs a SharePoint...");' +
 'return resp.json().then(function(data){' +
 'if(!resp.ok||data.error)throw new Error(data.error||"Error desconocido");' +
 'setBar(100,"Proceso completado");' +
@@ -127,32 +126,33 @@ export default {
   }
 };
 
-// ─── MAIN HANDLER ───────────────────────────────────────────
+// ─── MAIN HANDLER ────────────────────────────────────────────
 async function handleProcess(request, env) {
-  const form = await request.formData();
+  const form        = await request.formData();
   const pdfFile     = form.get('pdf');
   const despachoNum = form.get('despacho');
   const spFolder    = form.get('spFolder');
   if (!pdfFile || !despachoNum || !spFolder) throw new Error('Faltan campos requeridos');
 
-  const pdfBytes  = new Uint8Array(await pdfFile.arrayBuffer());
-  const pdfBase64 = uint8ToBase64(pdfBytes);
+  const pdfBytes = new Uint8Array(await pdfFile.arrayBuffer());
 
-  // 1. Extract cases with GPT-4o
-  const cases = await extractCasesWithGPT(pdfBase64, env.OPENAI_API_KEY);
-  if (!Array.isArray(cases) || cases.length === 0) throw new Error('No se pudieron extraer casos del PDF');
+  // 1. OCR con Azure Document Intelligence
+  const ocrText = await extractTextWithOCR(pdfBytes, env.DOCAI_ENDPOINT, env.DOCAI_KEY);
+  if (!ocrText || ocrText.length < 50) throw new Error('OCR no pudo extraer texto del PDF. Verifica que el PDF sea legible.');
 
-  // 2. Get SharePoint token
-  const spToken = await getSharePointToken(env.AZURE_TENANT_ID, env.AZURE_CLIENT_ID, env.AZURE_CLIENT_SECRET);
+  // 2. Extraer casos con GPT-4o
+  const cases = await extractCasesWithGPT(ocrText, env.OPENAI_API_KEY);
+  if (!Array.isArray(cases) || cases.length === 0) throw new Error('GPT-4o no pudo identificar casos en el texto. OCR extrajo: ' + ocrText.substring(0, 200));
 
-  // 3. Get SharePoint site and drive IDs
+  // 3. SharePoint auth y site info
+  const spToken  = await getSharePointToken(env.AZURE_TENANT_ID, env.AZURE_CLIENT_ID, env.AZURE_CLIENT_SECRET);
   const siteInfo = await getSharePointSite(spToken, env.SP_HOSTNAME, env.SP_SITE_PATH);
 
-  // 4. Create DESPACHO folder inside the target folder
+  // 4. Crear carpeta DESPACHO
   const despachoPath = spFolder + '/DESPACHO-' + despachoNum;
   await createSharePointFolder(spToken, siteInfo.driveId, despachoPath);
 
-  // 5. Process each case
+  // 5. Crear subcarpeta por caso y subir PDF completo (por ahora uno por caso)
   const results = [];
   for (const caso of cases) {
     const patientClean = sanitize(caso.patient_name || 'PACIENTE_DESCONOCIDO');
@@ -162,44 +162,87 @@ async function handleProcess(request, env) {
 
     await createSharePointFolder(spToken, siteInfo.driveId, casePath);
 
-    // Upload pages as individual PDFs
-    const pages      = caso.pages || [];
-    const docTypes   = caso.document_types || [];
-    const pageGroups = splitPdfPages(pdfBytes, pages.length);
+    // Subir el PDF completo a la carpeta del caso
+    const fileName = policyNum + '_' + patientClean + '.pdf';
+    await uploadSharePointFile(spToken, siteInfo.driveId, casePath + '/' + fileName, pdfBytes);
 
-    for (let i = 0; i < pages.length; i++) {
-      const docType  = docTypes[i] || ('pagina_' + pages[i]);
-      const fileName = (i + 1) + '_' + docType + '.pdf';
-      const filePath = casePath + '/' + fileName;
-      // For now upload placeholder — full PDF split requires pdf-lib
-      const infoBytes = new TextEncoder().encode('Pagina ' + pages[i] + ' - ' + patientClean);
-      await uploadSharePointFile(spToken, siteInfo.driveId, filePath, infoBytes);
-    }
-
-    results.push({ folder: folderName, pages: pages, status: 'OK' });
+    results.push({ folder: folderName, pages: caso.pages || [], status: 'OK' });
   }
 
   return { success: true, despacho: despachoNum, cases_processed: results.length, cases: results };
 }
 
-// ─── GPT-4o TEXT EXTRACTION ─────────────────────────────────
-async function extractCasesWithGPT(pdfBase64, apiKey) {
-  const bin      = atob(pdfBase64);
-  const readable = bin.replace(/[^\x20-\x7E\n\r\t]/g, ' ').replace(/ {4,}/g, ' ').replace(/\n{3,}/g, '\n\n');
-  const pdfText  = readable.substring(0, 14000);
+// ─── AZURE DOCUMENT INTELLIGENCE OCR ─────────────────────────
+async function extractTextWithOCR(pdfBytes, endpoint, key) {
+  // Submit document for analysis
+  const submitUrl = endpoint.replace(/\/$/, '') + '/formrecognizer/documentModels/prebuilt-read:analyze?api-version=2023-07-31';
 
+  const submitRes = await fetch(submitUrl, {
+    method: 'POST',
+    headers: {
+      'Ocp-Apim-Subscription-Key': key,
+      'Content-Type': 'application/pdf'
+    },
+    body: pdfBytes
+  });
+
+  if (!submitRes.ok) {
+    const err = await submitRes.text();
+    throw new Error('OCR submit error (' + submitRes.status + '): ' + err);
+  }
+
+  // Get operation URL from header
+  const operationUrl = submitRes.headers.get('Operation-Location');
+  if (!operationUrl) throw new Error('OCR no devolvio Operation-Location');
+
+  // Poll until complete (max 90 seconds)
+  for (let i = 0; i < 18; i++) {
+    await sleep(5000);
+    const pollRes  = await fetch(operationUrl, { headers: { 'Ocp-Apim-Subscription-Key': key } });
+    const pollData = await pollRes.json();
+
+    if (pollData.status === 'succeeded') {
+      // Extract all text grouped by page
+      const pages = pollData.analyzeResult && pollData.analyzeResult.pages ? pollData.analyzeResult.pages : [];
+      let fullText = '';
+      for (const page of pages) {
+        fullText += '\n--- PAGINA ' + page.pageNumber + ' ---\n';
+        const lines = page.lines || [];
+        for (const line of lines) {
+          fullText += line.content + '\n';
+        }
+      }
+      return fullText.trim();
+    }
+
+    if (pollData.status === 'failed') {
+      throw new Error('OCR fallo: ' + JSON.stringify(pollData.error));
+    }
+  }
+
+  throw new Error('OCR tardo demasiado (mas de 90 segundos). Intenta con un PDF mas pequeno.');
+}
+
+function sleep(ms) {
+  return new Promise(function(resolve) { setTimeout(resolve, ms); });
+}
+
+// ─── GPT-4o CASE EXTRACTION ──────────────────────────────────
+async function extractCasesWithGPT(ocrText, apiKey) {
   const prompt =
-    'Analiza el siguiente texto extraido de un PDF de documentos medicos Metrored/BUPA Ecuador.\n\n' +
-    'Cada caso tiene 2 documentos: 1) Estado de Cuenta METRORED y 2) Autorizacion BUPA.\n' +
-    'La pagina BUPA contiene el numero de poliza entre parentesis como "(700220)".\n\n' +
-    'Extrae todos los casos. Devuelve UNICAMENTE un array JSON valido sin texto extra ni markdown.\n\n' +
-    'Campos por caso:\n' +
-    '- policy_number: numero 6 digitos entre parentesis de BUPA. Si no hay, "SIN_POLIZA"\n' +
-    '- patient_name: nombre completo MAYUSCULAS del campo Asegurado o Paciente\n' +
-    '- pages: array de numeros de pagina del caso (empezando en 1)\n' +
+    'Analiza el siguiente texto extraido con OCR de un PDF de documentos medicos Metrored/BUPA Ecuador.\n\n' +
+    'El PDF contiene multiples CASOS. Cada caso tiene normalmente 2 paginas:\n' +
+    '1) Estado de Cuenta METRORED - contiene nombre del paciente\n' +
+    '2) Autorizacion de Cobertura BUPA - contiene numero de poliza entre parentesis ej: (700220)\n\n' +
+    'Extrae TODOS los casos. Devuelve UNICAMENTE un array JSON valido sin texto extra ni markdown.\n\n' +
+    'Campos requeridos por caso:\n' +
+    '- policy_number: numero de 6 digitos entre parentesis de la pagina BUPA. Si no hay, "SIN_POLIZA"\n' +
+    '- patient_name: nombre completo en MAYUSCULAS del campo Asegurado o Paciente\n' +
+    '- pages: array de numeros de pagina que pertenecen a este caso\n' +
     '- document_types: array con "estado_cuenta_metrored" o "autorizacion_cobertura_bupa"\n\n' +
-    'Ejemplo: [{"policy_number":"700220","patient_name":"RAMIREZ ANCHUNDIA EDWARD","pages":[1,2],"document_types":["estado_cuenta_metrored","autorizacion_cobertura_bupa"]}]\n\n' +
-    'TEXTO DEL PDF:\n' + pdfText;
+    'Ejemplo de respuesta:\n' +
+    '[{"policy_number":"700220","patient_name":"RAMIREZ ANCHUNDIA EDWARD FABRICIO","pages":[1,2],"document_types":["estado_cuenta_metrored","autorizacion_cobertura_bupa"]}]\n\n' +
+    'TEXTO OCR DEL PDF:\n' + ocrText.substring(0, 14000);
 
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -209,7 +252,7 @@ async function extractCasesWithGPT(pdfBase64, apiKey) {
 
   if (!response.ok) {
     const err = await response.text();
-    throw new Error('OpenAI API error (' + response.status + '): ' + err);
+    throw new Error('OpenAI error (' + response.status + '): ' + err);
   }
 
   const data    = await response.json();
@@ -217,18 +260,18 @@ async function extractCasesWithGPT(pdfBase64, apiKey) {
   const cleaned = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
 
   try { return JSON.parse(cleaned); }
-  catch (e) { throw new Error('Respuesta IA no es JSON: ' + cleaned.substring(0, 300)); }
+  catch (e) { throw new Error('GPT-4o no devolvio JSON valido: ' + cleaned.substring(0, 300)); }
 }
 
 // ─── SHAREPOINT AUTH ─────────────────────────────────────────
 async function getSharePointToken(tenantId, clientId, clientSecret) {
-  const url  = 'https://login.microsoftonline.com/' + tenantId + '/oauth2/v2.0/token';
-  const body = 'grant_type=client_credentials' +
+  const body =
+    'grant_type=client_credentials' +
     '&client_id=' + encodeURIComponent(clientId) +
     '&client_secret=' + encodeURIComponent(clientSecret) +
     '&scope=https%3A%2F%2Fgraph.microsoft.com%2F.default';
 
-  const res = await fetch(url, {
+  const res = await fetch('https://login.microsoftonline.com/' + tenantId + '/oauth2/v2.0/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body
@@ -239,40 +282,48 @@ async function getSharePointToken(tenantId, clientId, clientSecret) {
 }
 
 async function getSharePointSite(token, hostname, sitePath) {
-  // Get site ID
-  const siteUrl = 'https://graph.microsoft.com/v1.0/sites/' + hostname + ':/' + sitePath;
-  const siteRes = await fetch(siteUrl, { headers: { 'Authorization': 'Bearer ' + token } });
-  const site    = await siteRes.json();
-  if (!site.id) throw new Error('No se pudo obtener el sitio SharePoint: ' + JSON.stringify(site));
+  const siteRes = await fetch('https://graph.microsoft.com/v1.0/sites/' + hostname + ':/' + sitePath, {
+    headers: { 'Authorization': 'Bearer ' + token }
+  });
+  const site = await siteRes.json();
+  if (!site.id) throw new Error('Sitio SharePoint no encontrado: ' + JSON.stringify(site));
 
-  // Get default drive
   const driveRes = await fetch('https://graph.microsoft.com/v1.0/sites/' + site.id + '/drive', {
     headers: { 'Authorization': 'Bearer ' + token }
   });
   const drive = await driveRes.json();
-  if (!drive.id) throw new Error('No se pudo obtener el drive de SharePoint: ' + JSON.stringify(drive));
+  if (!drive.id) throw new Error('Drive SharePoint no encontrado: ' + JSON.stringify(drive));
 
   return { siteId: site.id, driveId: drive.id };
 }
 
 async function createSharePointFolder(token, driveId, folderPath) {
-  // Split path and create each segment
   const parts  = folderPath.split('/').filter(Boolean);
   let parentId = 'root';
 
   for (const part of parts) {
-    const url = 'https://graph.microsoft.com/v1.0/drives/' + driveId + '/items/' + parentId + '/children';
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: part,
-        folder: {}
-      })
-    });
+    const res = await fetch(
+      'https://graph.microsoft.com/v1.0/drives/' + driveId + '/items/' + parentId + '/children',
+      {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: part, folder: {} })
+      }
+    );
     const d = await res.json();
-    if (!d.id) throw new Error('Error creando carpeta "' + part + '": ' + JSON.stringify(d));
-    parentId = d.id;
+    // 409 conflict means folder already exists - get its ID
+    if (d.error && d.error.code === 'nameAlreadyExists') {
+      const existing = await fetch(
+        'https://graph.microsoft.com/v1.0/drives/' + driveId + '/items/' + parentId + ':/' + encodeURIComponent(part),
+        { headers: { 'Authorization': 'Bearer ' + token } }
+      );
+      const ex = await existing.json();
+      parentId = ex.id;
+    } else if (!d.id) {
+      throw new Error('Error creando carpeta "' + part + '": ' + JSON.stringify(d));
+    } else {
+      parentId = d.id;
+    }
   }
   return parentId;
 }
@@ -283,31 +334,28 @@ async function uploadSharePointFile(token, driveId, filePath, fileBytes) {
   const folderPath = parts.join('/');
 
   // Get folder ID
-  const folderUrl = 'https://graph.microsoft.com/v1.0/drives/' + driveId + '/root:/' + folderPath;
-  const folderRes = await fetch(folderUrl, { headers: { 'Authorization': 'Bearer ' + token } });
-  const folder    = await folderRes.json();
-  if (!folder.id) throw new Error('Carpeta no encontrada: ' + folderPath);
+  const folderRes = await fetch(
+    'https://graph.microsoft.com/v1.0/drives/' + driveId + '/root:/' + folderPath,
+    { headers: { 'Authorization': 'Bearer ' + token } }
+  );
+  const folder = await folderRes.json();
+  if (!folder.id) throw new Error('Carpeta no encontrada para upload: ' + folderPath);
 
-  // Upload file
-  const uploadUrl = 'https://graph.microsoft.com/v1.0/drives/' + driveId + '/items/' + folder.id + ':/' + fileName + ':/content';
+  // Upload file (up to 4MB direct upload)
+  const uploadUrl = 'https://graph.microsoft.com/v1.0/drives/' + driveId + '/items/' + folder.id + ':/' + encodeURIComponent(fileName) + ':/content';
   const res = await fetch(uploadUrl, {
     method: 'PUT',
     headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/pdf' },
     body: fileBytes
   });
   const d = await res.json();
-  if (!d.id) throw new Error('Error subiendo archivo "' + fileName + '": ' + JSON.stringify(d));
+  if (!d.id) throw new Error('Error subiendo "' + fileName + '": ' + JSON.stringify(d));
   return d.id;
 }
 
 // ─── UTILITIES ───────────────────────────────────────────────
-function splitPdfPages(pdfBytes, count) {
-  // Returns placeholder — real split needs pdf-lib
-  return Array(count).fill(pdfBytes.slice(0, 100));
-}
-
 function sanitize(str) {
-  return str.replace(/[<>:"/\\|?*\x00-\x1F#%{}^~\[\]`]/g, '').replace(/\s+/g, ' ').trim().substring(0, 80);
+  return str.replace(/[<>:"/\\|?*\x00-\x1F#%{}^~\[\]`']/g, '').replace(/\s+/g, ' ').trim().substring(0, 60);
 }
 
 function uint8ToBase64(arr) {
