@@ -260,12 +260,12 @@ async function extractCasesWithGPT(ocrText, apiKey) {
     '- document_types: array con "estado_cuenta_metrored" o "autorizacion_cobertura_bupa"\n\n' +
     'Ejemplo de respuesta:\n' +
     '[{"policy_number":"700220","patient_name":"RAMIREZ ANCHUNDIA EDWARD FABRICIO","pages":[1,2],"document_types":["estado_cuenta_metrored","autorizacion_cobertura_bupa"]}]\n\n' +
-    'TEXTO OCR DEL PDF:\n' + ocrText.substring(0, 14000);
+    'TEXTO OCR DEL PDF:\n' + ocrText;
 
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-    body: JSON.stringify({ model: 'gpt-4o', max_tokens: 2048, messages: [{ role: 'user', content: prompt }] })
+    body: JSON.stringify({ model: 'gpt-4o', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] })
   });
 
   if (!response.ok) {
