@@ -247,38 +247,77 @@ function sleep(ms) {
 
 // ─── GPT-4o CASE EXTRACTION ──────────────────────────────────
 async function extractCasesWithGPT(ocrText, apiKey) {
-  const prompt =
-    'Analiza el siguiente texto extraido con OCR de un PDF de documentos medicos Metrored/BUPA Ecuador.\n\n' +
-    'El PDF contiene multiples CASOS. Cada caso tiene normalmente 2 paginas:\n' +
-    '1) Estado de Cuenta METRORED - contiene nombre del paciente\n' +
-    '2) Autorizacion de Cobertura BUPA - contiene numero de poliza entre parentesis ej: (700220)\n\n' +
-    'Extrae TODOS los casos. Devuelve UNICAMENTE un array JSON valido sin texto extra ni markdown.\n\n' +
-    'Campos requeridos por caso:\n' +
-    '- policy_number: numero de 6 digitos entre parentesis de la pagina BUPA. Si no hay, "SIN_POLIZA"\n' +
-    '- patient_name: nombre completo en MAYUSCULAS del campo Asegurado o Paciente\n' +
-    '- pages: array de numeros de pagina que pertenecen a este caso\n' +
-    '- document_types: array con "estado_cuenta_metrored" o "autorizacion_cobertura_bupa"\n\n' +
-    'Ejemplo de respuesta:\n' +
-    '[{"policy_number":"700220","patient_name":"RAMIREZ ANCHUNDIA EDWARD FABRICIO","pages":[1,2],"document_types":["estado_cuenta_metrored","autorizacion_cobertura_bupa"]}]\n\n' +
-    'TEXTO OCR DEL PDF:\n' + ocrText;
-
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-    body: JSON.stringify({ model: 'gpt-4o', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] })
-  });
-
-  if (!response.ok) {
-    const err = await response.text();
-    throw new Error('OpenAI error (' + response.status + '): ' + err);
+  // Split OCR text by page markers and process in chunks of 10 pages
+  const pagePattern = /--- PAGINA (\d+) ---/g;
+  const pageMatches = [...ocrText.matchAll(pagePattern)];
+  
+  if (pageMatches.length === 0) {
+    throw new Error('OCR no identifico paginas en el documento');
   }
 
-  const data    = await response.json();
-  const raw     = (data.choices && data.choices[0] && data.choices[0].message) ? data.choices[0].message.content.trim() : '';
-  const cleaned = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+  // Build page map: pageNumber -> text content
+  const pageMap = {};
+  for (let i = 0; i < pageMatches.length; i++) {
+    const pageNum = parseInt(pageMatches[i][1]);
+    const start = pageMatches[i].index;
+    const end = i + 1 < pageMatches.length ? pageMatches[i+1].index : ocrText.length;
+    pageMap[pageNum] = ocrText.slice(start, end).trim();
+  }
 
-  try { return JSON.parse(cleaned); }
-  catch (e) { throw new Error('GPT-4o no devolvio JSON valido: ' + cleaned.substring(0, 300)); }
+  const totalPages = pageMatches.length;
+  const allCases = [];
+  
+  // Process in chunks of 8 pages (4 cases at a time)
+  const chunkSize = 8;
+  let pageOffset = 0;
+  
+  for (let startPage = 1; startPage <= totalPages; startPage += chunkSize) {
+    const endPage = Math.min(startPage + chunkSize - 1, totalPages);
+    
+    // Build chunk text with page numbers
+    let chunkText = '';
+    for (let p = startPage; p <= endPage; p++) {
+      if (pageMap[p]) chunkText += pageMap[p] + '\n\n';
+    }
+    
+    const prompt =
+      'Analiza el siguiente texto OCR de paginas ' + startPage + ' a ' + endPage + ' de un PDF medico Metrored/BUPA Ecuador.\n\n' +
+      'Cada caso tiene 2 paginas: 1) Estado de Cuenta METRORED (nombre del paciente en campo "Paciente:") y 2) Autorizacion BUPA (numero de poliza entre parentesis como "(700220)").\n\n' +
+      'IMPORTANTE: Algunos casos tienen solo pagina Metrored sin BUPA — usa "SIN_POLIZA" para esos.\n' +
+      'Algunos documentos son de otras aseguradoras (CLAVESEGUROS, PLUS MEDICAL) — incluyelos con "SIN_POLIZA".\n\n' +
+      'Devuelve UNICAMENTE array JSON sin texto extra ni markdown:\n' +
+      '[{"policy_number":"700220","patient_name":"APELLIDO NOMBRE","pages":[1,2],"document_types":["estado_cuenta_metrored","autorizacion_cobertura_bupa"]}]\n\n' +
+      'Si no hay casos en este bloque, devuelve: []\n\n' +
+      'TEXTO OCR:\n' + chunkText;
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+      body: JSON.stringify({ model: 'gpt-4o', max_tokens: 2048, messages: [{ role: 'user', content: prompt }] })
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error('OpenAI error (' + response.status + '): ' + err);
+    }
+
+    const data    = await response.json();
+    const raw     = (data.choices && data.choices[0] && data.choices[0].message) ? data.choices[0].message.content.trim() : '[]';
+    const cleaned = raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '').trim();
+
+    try {
+      const chunk = JSON.parse(cleaned);
+      if (Array.isArray(chunk)) allCases.push(...chunk);
+    } catch (e) {
+      // Skip unparseable chunks, continue
+    }
+  }
+
+  if (allCases.length === 0) {
+    throw new Error('No se pudieron extraer casos de ninguna pagina');
+  }
+
+  return allCases;
 }
 
 // ─── SHAREPOINT AUTH ─────────────────────────────────────────
