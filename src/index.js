@@ -297,6 +297,11 @@ async function run() {
       setBar(10 + Math.round((c / chunks) * 55), 'OCR bloque ' + (c+1) + '/' + chunks + '...');
       var ocrText = await ocrChunk(cb, cfg.ocrEndpoint, cfg.ocrKey);
       allCases = allCases.concat(extractCases(ocrText, sp));
+      // Respetar limite de rate del plan F0 (1 req / 6 seg)
+      if (c < chunks - 1) {
+        setBar(10 + Math.round(((c+1) / chunks) * 55), 'Esperando rate limit OCR (' + (c+1) + '/' + chunks + ')...');
+        await new Promise(function(res) { setTimeout(res, 7000); });
+      }
     }
 
     setBar(68, 'Identificados ' + allCases.length + ' casos. Subiendo a SharePoint...');
