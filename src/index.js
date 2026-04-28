@@ -305,19 +305,35 @@ async function run() {
     }
 
     setBar(68, 'Identificados ' + allCases.length + ' casos. Subiendo a SharePoint...');
-    var fd = new FormData();
-    fd.append('pdf', new Blob([fullBytes], { type: 'application/pdf' }), file.name);
-    fd.append('despacho', despacho);
-    fd.append('spFolder', spFolder);
-    fd.append('cases', JSON.stringify(allCases));
 
-    var resp = await fetch('/api/upload', { method: 'POST', body: fd });
-    var data = await resp.json();
-    if (data.error) throw new Error(data.error);
+    // Send cases in batches of 5 to avoid Worker subrequest limit
+    var batchSize = 5;
+    var allResults = [];
+    var totalBatches = Math.ceil(allCases.length / batchSize);
+    var despachoCreated = false;
+
+    for (var b = 0; b < totalBatches; b++) {
+      var batchCases = allCases.slice(b * batchSize, (b + 1) * batchSize);
+      var pct = 68 + Math.round((b / totalBatches) * 28);
+      setBar(pct, 'Subiendo lote ' + (b+1) + '/' + totalBatches + ' a SharePoint...');
+
+      var fd = new FormData();
+      fd.append('pdf', new Blob([fullBytes], { type: 'application/pdf' }), file.name);
+      fd.append('despacho', despacho);
+      fd.append('spFolder', spFolder);
+      fd.append('cases', JSON.stringify(batchCases));
+      fd.append('despachoCreated', despachoCreated ? '1' : '0');
+
+      var resp = await fetch('/api/upload', { method: 'POST', body: fd });
+      var data = await resp.json();
+      if (data.error) throw new Error('Lote ' + (b+1) + ': ' + data.error);
+      despachoCreated = true;
+      allResults = allResults.concat(data.cases);
+    }
 
     setBar(100, 'Completado');
-    var html = '<div class="res-sum">' + data.cases_processed + ' casos procesados &mdash; Despacho: ' + data.despacho + '</div>';
-    data.cases.forEach(function(c) {
+    var html = '<div class="res-sum">' + allResults.length + ' casos procesados &mdash; Despacho: ' + despacho + '</div>';
+    allResults.forEach(function(c) {
       html += '<div class="res-item"><strong>' + c.folder + '</strong>&nbsp;&mdash;&nbsp;pags: ' + c.pages.join(', ') + '</div>';
     });
     var res = document.getElementById('res');
@@ -377,7 +393,10 @@ async function handleUpload(request, env) {
   const spToken  = await getSharePointToken(env.AZURE_TENANT_ID, env.AZURE_CLIENT_ID, env.AZURE_CLIENT_SECRET);
   const siteInfo = await getSharePointSite(spToken, env.SP_HOSTNAME, env.SP_SITE_PATH);
   const despachoPath = spFolder + '/DESPACHO-' + despacho;
-  await createSharePointFolder(spToken, siteInfo.driveId, despachoPath);
+  const despachoCreated = form.get('despachoCreated') === '1';
+  if (!despachoCreated) {
+    await createSharePointFolder(spToken, siteInfo.driveId, despachoPath);
+  }
 
   const results = [];
   for (const caso of allCases) {
@@ -390,16 +409,17 @@ async function handleUpload(request, env) {
 
     await createSharePointFolder(spToken, siteInfo.driveId, casePath);
 
+    // Build a single PDF with all pages of this case
+    const casePdf = await PDFDocument.create();
     for (let i = 0; i < pages.length; i++) {
       const idx = pages[i] - 1;
       if (idx < 0 || idx >= total) continue;
-      const single = await PDFDocument.create();
-      const [pg]   = await single.copyPages(pdfDoc, [idx]);
-      single.addPage(pg);
-      const bytes  = await single.save();
-      const name   = (i + 1) + '_' + (types[i] || 'pagina_' + pages[i]) + '.pdf';
-      await uploadSharePointFile(spToken, siteInfo.driveId, casePath + '/' + name, bytes);
+      const [pg] = await casePdf.copyPages(pdfDoc, [idx]);
+      casePdf.addPage(pg);
     }
+    const caseBytes = await casePdf.save();
+    const caseName  = policy + '_' + patient + '.pdf';
+    await uploadSharePointFile(spToken, siteInfo.driveId, casePath + '/' + caseName, caseBytes);
     results.push({ folder, pages, status: 'OK' });
   }
 
